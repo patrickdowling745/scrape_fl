@@ -7,14 +7,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 import pandas as pd
 
-# ---------- One-time setup (per Streamlit session) ----------
-@st.cache_resource
-def ensure_chromium():
-    # Install the Chromium binary Playwright needs (do it once per session)
-    subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
-    return True
 
-ensure_chromium()
 
 # Temporary extraction directory (per run)
 EXTRACT_DIR = Path("temp_extract")
