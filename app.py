@@ -186,13 +186,14 @@ def _pick_target_width(roll_keys: pd.Series) -> int:
     return int(lengths.max())
 
 def do_merge(tp_file_path: str, county: str):
+    """Merge TaxProper file with county's 2025P NAL in memory-safe chunks."""
+    import csv
+    import math
+
     # 1) Locate county 2025P ZIP
     file_item = find_2025p_zip(county)
     if not file_item:
-        st.error(
-            f"No **2025 Preliminary (2025P)** ZIP found for “{county}”. "
-            "It might not be published in the 2025P folder yet, or the name differs."
-        )
+        st.error(f"No **2025P** ZIP found for “{county}”.")
         return None, {}
 
     # 2) Download & extract
@@ -202,61 +203,84 @@ def do_merge(tp_file_path: str, county: str):
         st.error("No CSV inside the downloaded ZIP.")
         return None, {}
 
-    # 3) Load CSVs
-    df_roll = safe_read_csv(csv_path)
+    # 3) Load TaxProper file fully into memory (small)
     df_tp = safe_read_csv(tp_file_path)
-
-    # 4) Detect parcel columns
-    roll_col = _find_column(df_roll, ["PARCEL_ID", "PARCELID", "PARCEL", "PARCEL NUMBER", "PARCEL_NO", "PARCELNO"])
-    if not roll_col:
-        st.error(
-            "Parcel column not found in the 2025P CSV (looked for PARCEL_ID / PARCELID / PARCEL / PARCEL NUMBER / PARCEL_NO)."
-        )
-        return None, {}
-
     tp_col = _find_column(df_tp, ["Parcel ID"])
     if not tp_col:
         st.error("Column 'Parcel ID' not found in your TaxProper CSV.")
         return None, {}
 
-    # 5) Normalize IDs
-    df_roll["_PID_"] = _clean_pid_series(df_roll[roll_col])
     df_tp["_PID_"] = _clean_pid_series(df_tp[tp_col])
+    tp_ids = set(df_tp["_PID_"])
 
-    # 6) First-pass exact match
-    first = pd.merge(df_roll, df_tp, on="_PID_", how="inner", suffixes=("_roll", "_tp"))
+    # 4) Target width for zero-fill retry
+    #    We'll figure it from the roll file in the first chunk
+    target_width = None
 
-    # 7) Leading-zero retry ONLY for left-unmatched TP rows,
-    #    padding to a target width inferred from roll IDs (mode length, else max).
-    target_width = _pick_target_width(df_roll["_PID_"])
-    left_unmatched_tp = df_tp[~df_tp["_PID_"].isin(first["_PID_"])].copy()
+    # Prepare temp file for matched rows
+    matches_path = Path(tempfile.gettempdir()) / "merged_results_large.csv"
+    if matches_path.exists():
+        matches_path.unlink()
 
-    retry = pd.DataFrame()
-    if target_width > 0 and not left_unmatched_tp.empty:
-        tp_retry = left_unmatched_tp.copy()
-        tp_retry["_PID_"] = tp_retry["_PID_"].str.zfill(target_width)
-        # only keep rows that actually changed after zfill to avoid duplicates
-        changed = tp_retry["_PID_"] != left_unmatched_tp["_PID_"]
-        tp_retry = tp_retry.loc[changed]
-        if not tp_retry.empty:
-            retry = pd.merge(df_roll, tp_retry, on="_PID_", how="inner", suffixes=("_roll", "_tp"))
+    first_pass_count = 0
+    retry_count = 0
+    roll_rows_total = 0
 
-    # 8) Combine & dedupe on the key
-    combined = pd.concat([first, retry], ignore_index=True)
-    if not combined.empty:
-        combined = combined[~combined["_PID_"].duplicated(keep="first")]
+    # 5) Read roll file in chunks
+    chunksize = 50000
+    with pd.read_csv(csv_path, dtype=str, low_memory=False, chunksize=chunksize) as reader:
+        for i, chunk in enumerate(reader):
+            roll_rows_total += len(chunk)
 
-    stats = {
-        "roll_rows": len(df_roll),
-        "tp_rows": len(df_tp),
-        "first_pass_matches": len(first),
-        "retry_matches": len(retry),
-        "combined_matches": len(combined),
-        "target_width": target_width,
-        "zip_name": file_item.get("Name"),
-    }
+            if target_width is None:
+                # Find roll parcel column
+                roll_col = _find_column(chunk, ["PARCEL_ID", "PARCELID", "PARCEL", "PARCEL NUMBER", "PARCEL_NO", "PARCELNO"])
+                if not roll_col:
+                    st.error("Parcel column not found in roll file.")
+                    return None, {}
+                # compute target width
+                target_width = _pick_target_width(_clean_pid_series(chunk[roll_col]))
 
-    return (combined if not combined.empty else None), stats
+            # Clean IDs
+            chunk["_PID_"] = _clean_pid_series(chunk[roll_col])
+
+            # First-pass match
+            fp_mask = chunk["_PID_"].isin(tp_ids)
+            first_pass_matches = chunk.loc[fp_mask]
+            first_pass_count += len(first_pass_matches)
+
+            # Retry match: zero-fill only if needed
+            retry_matches = pd.DataFrame()
+            if target_width > 0:
+                retry_ids = {pid.zfill(target_width) for pid in tp_ids}
+                retry_mask = chunk["_PID_"].isin(retry_ids) & ~fp_mask
+                retry_matches = chunk.loc[retry_mask]
+                retry_count += len(retry_matches)
+
+            # Append matches to file
+            if not first_pass_matches.empty or not retry_matches.empty:
+                pd.concat([first_pass_matches, retry_matches]).to_csv(
+                    matches_path, mode="a", header=not matches_path.exists(), index=False, quoting=csv.QUOTE_NONNUMERIC
+                )
+
+    # Load combined matches back for preview
+    if matches_path.exists() and matches_path.stat().st_size > 0:
+        # Only preview first 50 rows to save memory
+        preview_df = pd.read_csv(matches_path, dtype=str, nrows=50)
+        stats = {
+            "roll_rows": roll_rows_total,
+            "tp_rows": len(df_tp),
+            "first_pass_matches": first_pass_count,
+            "retry_matches": retry_count,
+            "combined_matches": first_pass_count + retry_count,
+            "target_width": target_width or 0,
+            "zip_name": file_item.get("Name"),
+            "matches_path": matches_path,
+        }
+        return preview_df, stats
+
+    return None, {}
+
 
 # ============================================================
 # Minimal UI
