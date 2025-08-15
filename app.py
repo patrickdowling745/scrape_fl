@@ -30,8 +30,10 @@ def launch_browser(p):
             "--no-zygote",
             "--single-process",
         ],
+        executable_path=p.chromium.executable_path(),
         timeout=120_000,  # give Chromium more time to start
     )
+
 
 def safe_read_csv(path):
     # Try utf-8 first, fall back to latin-1 if needed
