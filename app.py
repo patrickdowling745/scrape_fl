@@ -19,7 +19,10 @@ URL = (
 )
 
 def launch_browser(p):
-    # Hardened launch for Streamlit/Docker-ish environments
+    path = p.chromium.executable_path()
+    st.write("Chromium path:", path)
+    if not Path(path).exists():
+        st.error(f"Chromium executable not found at {path}")
     return p.chromium.launch(
         headless=True,
         args=[
@@ -30,8 +33,8 @@ def launch_browser(p):
             "--no-zygote",
             "--single-process",
         ],
-        executable_path=p.chromium.executable_path(),
-        timeout=120_000,  # give Chromium more time to start
+        executable_path=path,
+        timeout=120_000,
     )
 
 
