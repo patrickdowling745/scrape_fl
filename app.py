@@ -1,294 +1,215 @@
+import io
 import re
-import datetime as dt
-from pathlib import Path
-import tempfile
-import zipfile
-
 import pandas as pd
-import requests
 import streamlit as st
 
-# ============================================================
-# Config
-# ============================================================
-st.set_page_config(page_title="FL 2025P NAL + TaxProper Merge", layout="wide")
+st.set_page_config(page_title="Tax Match (with Leading-Zero Retry)", layout="wide")
 
-BASE = "https://floridarevenue.com"
-SITE = f"{BASE}/property/dataportal"
-API = f"{SITE}/_api/web"
+# -------------------------
+# Helpers
+# -------------------------
+def normalize_series(
+    s: pd.Series,
+    *,
+    strip_spaces: bool = True,
+    to_upper: bool = True,
+    keep_only_alnum: bool = False,
+    keep_only_digits: bool = False,
+):
+    s = s.astype(str).fillna("")
+    if strip_spaces:
+        s = s.str.strip()
+    if to_upper:
+        s = s.str.upper()
+    if keep_only_digits:
+        s = s.apply(lambda x: re.sub(r"[^0-9]", "", x))
+    elif keep_only_alnum:
+        s = s.apply(lambda x: re.sub(r"[^0-9A-Z]", "", x))
+    return s
 
-# SharePoint library + fixed 2025P folder (STRICT: we ONLY use this)
-DOC_LIB = "/property/dataportal/Documents"
-NAL_2025P = "/property/dataportal/Documents/PTO Data Portal/Tax Roll Data Files/NAL/2025P"
 
-HEADERS = {
-    "Accept": "application/json;odata=nometadata",
-    "User-Agent": "Mozilla/5.0 (Streamlit/SharePoint)",
-}
+def zfill_to_width(series: pd.Series, width: int) -> pd.Series:
+    return series.astype(str).str.zfill(width)
 
-EXTRACT_DIR = Path("temp_extract")
-EXTRACT_DIR.mkdir(exist_ok=True)
 
-# ============================================================
-# SharePoint helpers (no browser)
-# ============================================================
-def _enc(path: str) -> str:
-    """Encode server-relative path for OData calls; keep '/' and '~' intact."""
-    from urllib.parse import quote
-    return quote(path, safe="/~ ")
-
-def _sp_get_json(url: str):
-    r = requests.get(url, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-def _sp_post_json(url: str, payload: dict):
-    r = requests.post(
-        url,
-        json=payload,
-        headers={
-            **HEADERS,
-            "Content-Type": "application/json;odata=nometadata",
-            "Accept": "application/json;odata=nometadata",
-        },
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.json()
-
-def list_folders(server_relative: str):
-    url = f"{API}/GetFolderByServerRelativeUrl('{_enc(server_relative)}')/Folders?$select=Name,ServerRelativeUrl"
-    return _sp_get_json(url).get("value", [])
-
-def list_files(server_relative: str):
-    url = f"{API}/GetFolderByServerRelativeUrl('{_enc(server_relative)}')/Files?$select=Name,ServerRelativeUrl,Length"
-    return _sp_get_json(url).get("value", [])
-
-def render_list(folder_server_relative: str):
+def match_with_leading_zero_retry(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    left_key: str,
+    right_key: str,
+    how_first: str = "inner",
+    normalize_opts: dict | None = None,
+):
     """
-    Fallback enumerator that often returns items even when /Files or /Folders look empty.
+    1) Normalize keys (same rules applied to both tables).
+    2) First pass: merge on the normalized key.
+    3) Find left-unmatched rows.
+    4) ZFILL ONLY the left-unmatched keys to the max len of right keys.
+    5) Second pass merge on the zfilled keys.
+    6) Combine results + drop duplicates.
     """
-    list_url = (f"{API}/GetListUsingPath(DecodedUrl=@list)"
-                f"/RenderListDataAsStream?@list=%27{_enc(DOC_LIB)}%27")
-    payload = {
-        "parameters": {
-            "FolderServerRelativeUrl": folder_server_relative,
-            "RenderOptions": 2,
-            "ViewXml": "<View/>",
-        }
+    normalize_opts = normalize_opts or {}
+    L = left.copy()
+    R = right.copy()
+
+    # Create normalized columns
+    L["_norm_key"] = normalize_series(L[left_key], **normalize_opts)
+    R["_norm_key"] = normalize_series(R[right_key], **normalize_opts)
+
+    # First pass
+    first = L.merge(R, left_on="_norm_key", right_on="_norm_key", how=how_first, suffixes=("_L", "_R"))
+
+    # Figure out left rows that did NOT match
+    matched_keys = set(first["_norm_key"].unique())
+    left_unmatched = L[~L["_norm_key"].isin(matched_keys)].copy()
+
+    # Determine a width for zero-fill from RIGHT side observed length distribution
+    # Use the max length of right keys after normalization (fallback to current left lengths if empty)
+    if len(R) > 0:
+        target_width = int(R["_norm_key"].str.len().max())
+        if pd.isna(target_width):
+            target_width = int(left_unmatched["_norm_key"].str.len().max() or 0)
+    else:
+        target_width = int(left_unmatched["_norm_key"].str.len().max() or 0)
+
+    # Second pass: only if we have something to zfill AND target width increases anything
+    second = pd.DataFrame()
+    if target_width > 0 and not left_unmatched.empty:
+        left_unmatched["_norm_key_retry"] = zfill_to_width(left_unmatched["_norm_key"], target_width)
+
+        # Only retry where zfill actually changed the value
+        retry_subset = left_unmatched[left_unmatched["_norm_key_retry"] != left_unmatched["_norm_key"]].copy()
+        if not retry_subset.empty:
+            second = retry_subset.merge(
+                R,
+                left_on="_norm_key_retry",
+                right_on="_norm_key",
+                how="inner",
+                suffixes=("_L", "_R"),
+            )
+
+    # Combine results
+    combined = pd.concat([first, second], ignore_index=True)
+
+    # Drop duplicate match rows by the key from each side, if present
+    # Build a dedup key (prefer the right normalized key)
+    if "_norm_key_R" in combined.columns:
+        # when both exist by suffixing from merges
+        dedup_key = combined["_norm_key_R"].fillna(combined["_norm_key"])
+    else:
+        dedup_key = combined["_norm_key"]
+
+    combined = combined.loc[~dedup_key.duplicated(keep="first")].copy()
+
+    # Compute final unmatched (after both passes)
+    after_match_keys = set(dedup_key.dropna().unique())
+    left_after = L[~L["_norm_key"].isin(after_match_keys)].copy()
+    right_after = R[~R["_norm_key"].isin(after_match_keys)].copy()
+
+    # Clean up helper columns for user display
+    def cleanup(df: pd.DataFrame):
+        cols = [c for c in df.columns if not c.startswith("_norm_key")]
+        return df[cols]
+
+    return {
+        "first_pass_matches": cleanup(first),
+        "retry_matches": cleanup(second),
+        "combined_matches": cleanup(combined),
+        "left_unmatched_after": cleanup(left_after),
+        "right_unmatched_after": cleanup(right_after),
+        "target_width": target_width,
     }
-    data = _sp_post_json(list_url, payload)
-    rows = data.get("Row", [])
-    files, folders = [], []
-    for row in rows:
-        # FSObjType: 1=folder, 0=file
-        if str(row.get("FSObjType")) == "1":
-            folders.append({
-                "Name": row.get("FileLeafRef"),
-                "ServerRelativeUrl": row.get("FileRef")
-            })
-        else:
-            files.append({
-                "Name": row.get("FileLeafRef"),
-                "ServerRelativeUrl": row.get("FileRef"),
-                "Length": row.get("FileSizeDisplay"),
-            })
-    return files, folders
 
-def smart_list(folder: str):
-    """
-    Try standard endpoints first; if empty, fall back to RenderListDataAsStream.
-    Returns (files, folders).
-    """
-    try:
-        f1, d1 = list_files(folder), list_folders(folder)
-        if f1 or d1:
-            return f1, d1
-    except Exception:
-        pass
-    try:
-        return render_list(folder)
-    except Exception:
-        return [], []
 
-def _norm(s: str) -> str:
-    """Uppercase alnum only (to match 'Clay' with 'CLAY_2025P.zip', etc.)."""
-    return re.sub(r"[^0-9A-Z]", "", (s or "").upper())
+def to_csv_download(df: pd.DataFrame, filename: str) -> tuple[bytes, str]:
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue().encode(), filename
 
-def list_all_2025p_files(max_depth: int = 3):
-    """
-    BFS from NAL_2025P up to max_depth; return a list of file items.
-    """
-    files_out = []
-    visited = set()
-    queue = [(NAL_2025P, 0)]
-    while queue:
-        folder, depth = queue.pop(0)
-        if folder in visited or depth > max_depth:
-            continue
-        visited.add(folder)
-        files, folders = smart_list(folder)
-        files_out.extend(files)
-        for fol in folders:
-            queue.append((fol["ServerRelativeUrl"], depth + 1))
-    # de-dup by ServerRelativeUrl
-    seen = set()
-    unique_files = []
-    for f in files_out:
-        key = f.get("ServerRelativeUrl")
-        if key and key not in seen:
-            seen.add(key)
-            unique_files.append(f)
-    return unique_files
 
-def find_2025p_zip(county: str):
-    """
-    STRICT: find a county ZIP ONLY under the fixed 2025P folder.
-    No 2024 fallbacks.
-    """
-    target = _norm(county)
-    for f in list_all_2025p_files():
-        nm = f.get("Name") or ""
-        if nm.lower().endswith(".zip") and target in _norm(nm):
-            return f
-    return None
-
-def download_zip(file_item: dict) -> Path:
-    url = BASE + file_item["ServerRelativeUrl"]
-    out = Path(tempfile.gettempdir()) / file_item["Name"]
-    with requests.get(url, headers=HEADERS, stream=True, timeout=180) as r:
-        r.raise_for_status()
-        with open(out, "wb") as f:
-            for chunk in r.iter_content(1024 * 64):
-                if chunk:
-                    f.write(chunk)
-    return out
-
-# ============================================================
-# CSV helpers + merge
-# ============================================================
-def safe_read_csv(path: str | Path) -> pd.DataFrame:
-    try:
-        return pd.read_csv(path, dtype=str, low_memory=False)
-    except UnicodeDecodeError:
-        return pd.read_csv(path, dtype=str, low_memory=False, encoding="latin-1")
-
-def extract_first_csv(zip_path: Path) -> Path | None:
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-        if not csvs:
-            return None
-        csv_name = csvs[0]
-        zf.extract(csv_name, path=EXTRACT_DIR)
-        return EXTRACT_DIR / csv_name
-
-def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    lower = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lower:
-            return lower[cand.lower()]
-    return None
-
-def _clean_pid_series(s: pd.Series) -> pd.Series:
-    # remove non-alphanumeric + uppercase to normalize IDs
-    return s.astype(str).map(lambda x: re.sub(r"[^0-9A-Za-z]", "", x or "").upper())
-
-def do_merge(tp_file_path: str, county: str):
-    # 1) Find the county’s 2025P ZIP strictly under the 2025P folder
-    file_item = find_2025p_zip(county)
-    if not file_item:
-        st.error(
-            f"No **2025 Preliminary (2025P)** ZIP found for “{county}”. "
-            "It might not be published in the 2025P folder yet, or the name differs."
-        )
-        return None
-
-    st.info(f"Using 2025P ZIP: {file_item['Name']}")
-    # 2) Download & extract
-    zip_path = download_zip(file_item)
-    csv_path = extract_first_csv(zip_path)
-    if not csv_path:
-        st.error("No CSV inside the downloaded ZIP.")
-        return None
-
-    # 3) Load CSVs
-    df_roll = safe_read_csv(csv_path)
-    df_tp = safe_read_csv(tp_file_path)
-
-    # 4) Detect parcel columns
-    roll_col = _find_column(df_roll, ["PARCEL_ID", "PARCELID", "PARCEL", "PARCEL NUMBER", "PARCEL_NO", "PARCELNO"])
-    if not roll_col:
-        st.error(
-            "Parcel column not found in the 2025P CSV (looked for PARCEL_ID / PARCELID / PARCEL / PARCEL NUMBER / PARCEL_NO)."
-        )
-        return None
-
-    tp_col = _find_column(df_tp, ["Parcel ID"])
-    if not tp_col:
-        st.error("Column 'Parcel ID' not found in your TaxProper CSV.")
-        return None
-
-    # 5) Normalize & merge
-    df_roll["_PID_"] = _clean_pid_series(df_roll[roll_col])
-    df_tp["_PID_"] = _clean_pid_series(df_tp[tp_col])
-
-    merged = pd.merge(df_roll, df_tp, on="_PID_", how="inner", suffixes=("_roll", "_tp"))
-
-    # Retry with 0-prefixed TP IDs if empty (common edge case)
-    if merged.empty:
-        tp_retry = df_tp.copy()
-        tp_retry["_PID_"] = "0" + tp_retry["_PID_"]
-        merged = pd.merge(df_roll, tp_retry, on="_PID_", how="inner", suffixes=("_roll", "_tp"))
-
-    return merged if not merged.empty else None
-
-# ============================================================
+# -------------------------
 # UI
-# ============================================================
-st.title("Florida **2025 Preliminary (2025P)** NAL + TaxProper Merge")
+# -------------------------
+st.title("Match Records with Leading-Zero Retry")
+st.caption("Upload two CSVs (e.g., TaxProper file on the left, County file on the right). "
+           "Pick the key columns. We'll match, then retry unmatched rows by zero-filling.")
 
 with st.sidebar:
-    st.markdown("### Debug / Inspect 2025P")
-    if st.button("List a few files under 2025P"):
-        try:
-            files = list_all_2025p_files()
-            if not files:
-                st.warning("No files visible under 2025P. The folder may be empty or restricted.")
-            else:
-                st.write("Found files (showing up to 20):")
-                for x in files[:20]:
-                    st.write("-", x.get("Name"))
-        except Exception as e:
-            st.error(f"Listing failed: {e!r}")
+    st.header("1) Upload Files")
+    left_file = st.file_uploader("Left CSV (e.g., TaxProper)", type=["csv"], key="left")
+    right_file = st.file_uploader("Right CSV (e.g., County)", type=["csv"], key="right")
 
-tp_file = st.file_uploader("Upload **TaxProper CSV**", type="csv")
-county = st.text_input("County (e.g., Clay, Pinellas)").strip()
+    st.header("2) Normalization Options")
+    strip_spaces = st.checkbox("Strip leading/trailing spaces", True)
+    to_upper = st.checkbox("Uppercase keys", True)
+    keep_only_digits = st.checkbox("Keep only digits (remove all non-digits)", False)
+    keep_only_alnum = st.checkbox("Keep only A–Z and 0–9", False)
+    st.caption("Tip: If your keys are parcel numbers that sometimes include dashes/spaces, "
+               "turn on **Keep only digits**.")
 
-c1, c2 = st.columns([1, 1])
-run_clicked = c1.button("Run Merge (2025P only)")
-if c2.button("Clear temp"):
-    try:
-        for p in EXTRACT_DIR.glob("*"):
-            p.unlink(missing_ok=True)
-        st.success("Cleared extracted files.")
-    except Exception as e:
-        st.error(f"Cleanup failed: {e}")
+    run_btn = st.button("Run match")
 
-if run_clicked:
-    if not tp_file or not county:
-        st.error("Please upload your TaxProper CSV and enter a county.")
-    else:
-        tp_path = "temp_tp.csv"
-        with open(tp_path, "wb") as f:
-            f.write(tp_file.getbuffer())
+if left_file and right_file:
+    left_df = pd.read_csv(left_file, dtype=str, low_memory=False)
+    right_df = pd.read_csv(right_file, dtype=str, low_memory=False)
 
-        with st.spinner("Fetching 2025P data and merging…"):
-            final_df = do_merge(tp_path, county)
+    st.subheader("Column Selection")
+    col_left = st.selectbox("Left key column", left_df.columns, index=0)
+    col_right = st.selectbox("Right key column", right_df.columns, index=0)
 
-        if isinstance(final_df, pd.DataFrame) and not final_df.empty:
-            st.success(f"Matches: {len(final_df)}")
-            st.dataframe(final_df.head(50))
-            csv_bytes = final_df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download Results CSV", csv_bytes, "merged_results_2025P.csv")
-        else:
-            st.warning("No matches found (or 2025P county file not available).")
+    if run_btn:
+        opts = dict(
+            strip_spaces=strip_spaces,
+            to_upper=to_upper,
+            keep_only_digits=keep_only_digits,
+            keep_only_alnum=(keep_only_alnum and not keep_only_digits),
+        )
+
+        with st.spinner("Matching..."):
+            res = match_with_leading_zero_retry(
+                left_df, right_df, col_left, col_right, how_first="inner", normalize_opts=opts
+            )
+
+        # Metrics
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Left rows", f"{len(left_df):,}")
+        c2.metric("Right rows", f"{len(right_df):,}")
+        c3.metric("Combined matches", f"{len(res['combined_matches']):,}")
+        c4.metric("Retry zfill width", res["target_width"])
+
+        tabs = st.tabs([
+            "Combined Matches", "First-Pass Matches", "Retry Matches",
+            "Left Unmatched (after both)", "Right Unmatched (after both)"
+        ])
+
+        with tabs[0]:
+            st.dataframe(res["combined_matches"], use_container_width=True)
+            if len(res["combined_matches"]) > 0:
+                data, name = to_csv_download(res["combined_matches"], "combined_matches.csv")
+                st.download_button("Download Combined Matches", data, file_name=name, mime="text/csv")
+
+        with tabs[1]:
+            st.dataframe(res["first_pass_matches"], use_container_width=True)
+            if len(res["first_pass_matches"]) > 0:
+                data, name = to_csv_download(res["first_pass_matches"], "first_pass_matches.csv")
+                st.download_button("Download First-Pass Matches", data, file_name=name, mime="text/csv")
+
+        with tabs[2]:
+            st.dataframe(res["retry_matches"], use_container_width=True)
+            if len(res["retry_matches"]) > 0:
+                data, name = to_csv_download(res["retry_matches"], "retry_matches.csv")
+                st.download_button("Download Retry Matches", data, file_name=name, mime="text/csv")
+
+        with tabs[3]:
+            st.dataframe(res["left_unmatched_after"], use_container_width=True)
+            if len(res["left_unmatched_after"]) > 0:
+                data, name = to_csv_download(res["left_unmatched_after"], "left_unmatched_after.csv")
+                st.download_button("Download Left Unmatched", data, file_name=name, mime="text/csv")
+
+        with tabs[4]:
+            st.dataframe(res["right_unmatched_after"], use_container_width=True)
+            if len(res["right_unmatched_after"]) > 0:
+                data, name = to_csv_download(res["right_unmatched_after"], "right_unmatched_after.csv")
+                st.download_button("Download Right Unmatched", data, file_name=name, mime="text/csv")
+else:
+    st.info("Upload both CSVs in the sidebar to begin.")
