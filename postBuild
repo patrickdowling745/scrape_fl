@@ -1,0 +1,6 @@
+#!/bin/bash
+# Install system dependencies for Playwright
+playwright install-deps
+
+# Install Chromium browser for Playwright
+playwright install chromium
