@@ -19,10 +19,13 @@ URL = (
 )
 
 def launch_browser(p):
-    # Chromium will now live inside .playwright
-    path = Path(".playwright") / "chromium-1181" / "chrome-linux" / "chrome"
-    if not path.exists():
-        st.error(f"Chromium executable not found at {path}")
+    # Look for Chromium in .playwright (bundled in image) first
+    local_path = Path(".playwright") / "chromium-1181" / "chrome-linux" / "chrome"
+    if local_path.exists():
+        exec_path = str(local_path)
+    else:
+        exec_path = p.chromium.executable_path  # fallback to default
+
     return p.chromium.launch(
         headless=True,
         args=[
@@ -33,10 +36,9 @@ def launch_browser(p):
             "--no-zygote",
             "--single-process",
         ],
-        executable_path=str(path),
+        executable_path=exec_path,
         timeout=120_000,
     )
-
 
 def safe_read_csv(path):
     # Try utf-8 first, fall back to latin-1 if needed
