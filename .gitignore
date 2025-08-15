@@ -1,17 +1,12 @@
-# Ignore Playwright browsers
-.playwright/
-
-# Ignore Python cache
+# Python
 __pycache__/
 *.pyc
-*.pyo
 
-# Ignore virtual environments
-.venv/
-env/
-venv/
-
-# Ignore Streamlit and temp files
+# Streamlit temp/cache
+temp_extract/
 .streamlit/
-*.log
 .DS_Store
+
+# ZIPs & outputs
+*.zip
+*.csv

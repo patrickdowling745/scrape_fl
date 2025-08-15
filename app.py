@@ -1,163 +1,294 @@
-import streamlit as st
-import os
-import zipfile
-import subprocess
-import tempfile
+import re
+import datetime as dt
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+import tempfile
+import zipfile
+
 import pandas as pd
+import requests
+import streamlit as st
 
+# ============================================================
+# Config
+# ============================================================
+st.set_page_config(page_title="FL 2025P NAL + TaxProper Merge", layout="wide")
 
+BASE = "https://floridarevenue.com"
+SITE = f"{BASE}/property/dataportal"
+API = f"{SITE}/_api/web"
 
-# Temporary extraction directory (per run)
+# SharePoint library + fixed 2025P folder (STRICT: we ONLY use this)
+DOC_LIB = "/property/dataportal/Documents"
+NAL_2025P = "/property/dataportal/Documents/PTO Data Portal/Tax Roll Data Files/NAL/2025P"
+
+HEADERS = {
+    "Accept": "application/json;odata=nometadata",
+    "User-Agent": "Mozilla/5.0 (Streamlit/SharePoint)",
+}
+
 EXTRACT_DIR = Path("temp_extract")
 EXTRACT_DIR.mkdir(exist_ok=True)
 
-URL = (
-    "https://floridarevenue.com/property/dataportal/Pages/default.aspx"
-    "?path=/property/dataportal/Documents/PTO%20Data%20Portal/Tax%20Roll%20Data%20Files/NAL/2025P"
-)
+# ============================================================
+# SharePoint helpers (no browser)
+# ============================================================
+def _enc(path: str) -> str:
+    """Encode server-relative path for OData calls; keep '/' and '~' intact."""
+    from urllib.parse import quote
+    return quote(path, safe="/~ ")
 
-def launch_browser(p):
-    # Look for Chromium in .playwright (bundled in image) first
-    local_path = Path(".playwright") / "chromium-1181" / "chrome-linux" / "chrome"
-    if local_path.exists():
-        exec_path = str(local_path)
-    else:
-        exec_path = p.chromium.executable_path  # fallback to default
+def _sp_get_json(url: str):
+    r = requests.get(url, headers=HEADERS, timeout=60)
+    r.raise_for_status()
+    return r.json()
 
-    return p.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-zygote",
-            "--single-process",
-        ],
-        executable_path=exec_path,
-        timeout=120_000,
+def _sp_post_json(url: str, payload: dict):
+    r = requests.post(
+        url,
+        json=payload,
+        headers={
+            **HEADERS,
+            "Content-Type": "application/json;odata=nometadata",
+            "Accept": "application/json;odata=nometadata",
+        },
+        timeout=60,
     )
+    r.raise_for_status()
+    return r.json()
 
-def safe_read_csv(path):
-    # Try utf-8 first, fall back to latin-1 if needed
+def list_folders(server_relative: str):
+    url = f"{API}/GetFolderByServerRelativeUrl('{_enc(server_relative)}')/Folders?$select=Name,ServerRelativeUrl"
+    return _sp_get_json(url).get("value", [])
+
+def list_files(server_relative: str):
+    url = f"{API}/GetFolderByServerRelativeUrl('{_enc(server_relative)}')/Files?$select=Name,ServerRelativeUrl,Length"
+    return _sp_get_json(url).get("value", [])
+
+def render_list(folder_server_relative: str):
+    """
+    Fallback enumerator that often returns items even when /Files or /Folders look empty.
+    """
+    list_url = (f"{API}/GetListUsingPath(DecodedUrl=@list)"
+                f"/RenderListDataAsStream?@list=%27{_enc(DOC_LIB)}%27")
+    payload = {
+        "parameters": {
+            "FolderServerRelativeUrl": folder_server_relative,
+            "RenderOptions": 2,
+            "ViewXml": "<View/>",
+        }
+    }
+    data = _sp_post_json(list_url, payload)
+    rows = data.get("Row", [])
+    files, folders = [], []
+    for row in rows:
+        # FSObjType: 1=folder, 0=file
+        if str(row.get("FSObjType")) == "1":
+            folders.append({
+                "Name": row.get("FileLeafRef"),
+                "ServerRelativeUrl": row.get("FileRef")
+            })
+        else:
+            files.append({
+                "Name": row.get("FileLeafRef"),
+                "ServerRelativeUrl": row.get("FileRef"),
+                "Length": row.get("FileSizeDisplay"),
+            })
+    return files, folders
+
+def smart_list(folder: str):
+    """
+    Try standard endpoints first; if empty, fall back to RenderListDataAsStream.
+    Returns (files, folders).
+    """
     try:
-        return pd.read_csv(path)
-    except UnicodeDecodeError:
-        return pd.read_csv(path, encoding="latin-1")
+        f1, d1 = list_files(folder), list_folders(folder)
+        if f1 or d1:
+            return f1, d1
+    except Exception:
+        pass
+    try:
+        return render_list(folder)
+    except Exception:
+        return [], []
 
-def scrape_and_merge(tp_file_path, county: str):
-    merged_results = []
+def _norm(s: str) -> str:
+    """Uppercase alnum only (to match 'Clay' with 'CLAY_2025P.zip', etc.)."""
+    return re.sub(r"[^0-9A-Z]", "", (s or "").upper())
 
-    with sync_playwright() as p:
-        browser = launch_browser(p)
-        context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
+def list_all_2025p_files(max_depth: int = 3):
+    """
+    BFS from NAL_2025P up to max_depth; return a list of file items.
+    """
+    files_out = []
+    visited = set()
+    queue = [(NAL_2025P, 0)]
+    while queue:
+        folder, depth = queue.pop(0)
+        if folder in visited or depth > max_depth:
+            continue
+        visited.add(folder)
+        files, folders = smart_list(folder)
+        files_out.extend(files)
+        for fol in folders:
+            queue.append((fol["ServerRelativeUrl"], depth + 1))
+    # de-dup by ServerRelativeUrl
+    seen = set()
+    unique_files = []
+    for f in files_out:
+        key = f.get("ServerRelativeUrl")
+        if key and key not in seen:
+            seen.add(key)
+            unique_files.append(f)
+    return unique_files
 
-        # Load the page and wait for DOM
-        page.goto(URL, wait_until="domcontentloaded", timeout=120_000)
-
-        try:
-            # Click the county link and capture the file download
-            with page.expect_download(timeout=120_000) as download_info:
-                # Be explicit: click an <a> that contains the county text
-                page.locator("a", has_text=county).first.click()
-            download = download_info.value
-
-            # Save zip to a real file path (Download.path() may be None on some hosts)
-            tmp_zip = Path(tempfile.gettempdir()) / f"{county}_nal.zip"
-            download.save_as(str(tmp_zip))
-
-            # Extract CSV from ZIP
-            with zipfile.ZipFile(tmp_zip, "r") as zf:
-                csv_candidates = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                if not csv_candidates:
-                    st.error(f"No CSV file found for {county}")
-                    return None
-
-                csv_name = csv_candidates[0]
-                zf.extract(csv_name, path=EXTRACT_DIR)
-                csv_path = EXTRACT_DIR / csv_name
-
-            # Read datasets
-            df_county = safe_read_csv(csv_path)
-            df_tp = safe_read_csv(tp_file_path)
-
-            # Normalize Parcel IDs
-            if "PARCEL_ID" not in df_county.columns:
-                st.error("Expected 'PARCEL_ID' column missing in county file.")
-                return None
-            if "Parcel ID" not in df_tp.columns:
-                st.error("Expected 'Parcel ID' column missing in TaxProper file.")
-                return None
-
-            df_county["PARCEL_ID"] = (
-                df_county["PARCEL_ID"].astype(str).str.replace("-", "", regex=False).str.strip()
-            )
-            df_tp["Parcel ID"] = (
-                df_tp["Parcel ID"].astype(str).str.replace("-", "", regex=False).str.strip()
-            )
-
-            # First merge attempt
-            merged_df = pd.merge(
-                df_county, df_tp, left_on="PARCEL_ID", right_on="Parcel ID", how="inner"
-            )
-
-            # Two-pass merge: prepend '0' for previously unmatched TP rows
-            if not merged_df.empty:
-                matched_ids = set(merged_df["Parcel ID"])
-                unmatched_tp = df_tp[~df_tp["Parcel ID"].isin(matched_ids)].copy()
-            else:
-                unmatched_tp = df_tp.copy()
-
-            if not unmatched_tp.empty:
-                unmatched_tp["Parcel ID"] = unmatched_tp["Parcel ID"].apply(lambda x: "0" + x)
-                retry_merge = pd.merge(
-                    df_county, unmatched_tp, left_on="PARCEL_ID", right_on="Parcel ID", how="inner"
-                )
-                if not retry_merge.empty:
-                    merged_df = pd.concat([merged_df, retry_merge], axis=0, ignore_index=True)
-
-            merged_results.append(merged_df)
-
-        except Exception as e:
-            # Streamlit Cloud redacts details in UI; still show what we can
-            st.error(f"Error processing {county}: {e}")
-
-        finally:
-            # Cleanup Playwright
-            context.close()
-            browser.close()
-
-    if merged_results:
-        out = pd.concat(merged_results, axis=0, ignore_index=True)
-        return out
+def find_2025p_zip(county: str):
+    """
+    STRICT: find a county ZIP ONLY under the fixed 2025P folder.
+    No 2024 fallbacks.
+    """
+    target = _norm(county)
+    for f in list_all_2025p_files():
+        nm = f.get("Name") or ""
+        if nm.lower().endswith(".zip") and target in _norm(nm):
+            return f
     return None
 
-# -------------------------
-# Streamlit UI
-# -------------------------
-st.title("Florida Tax Roll Scraper + TaxProper Merge")
+def download_zip(file_item: dict) -> Path:
+    url = BASE + file_item["ServerRelativeUrl"]
+    out = Path(tempfile.gettempdir()) / file_item["Name"]
+    with requests.get(url, headers=HEADERS, stream=True, timeout=180) as r:
+        r.raise_for_status()
+        with open(out, "wb") as f:
+            for chunk in r.iter_content(1024 * 64):
+                if chunk:
+                    f.write(chunk)
+    return out
 
-tp_file = st.file_uploader("Upload TaxProper CSV", type="csv")
-county = st.text_input("Enter County Name (e.g., Clay, Pinellas)")
+# ============================================================
+# CSV helpers + merge
+# ============================================================
+def safe_read_csv(path: str | Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, dtype=str, low_memory=False)
+    except UnicodeDecodeError:
+        return pd.read_csv(path, dtype=str, low_memory=False, encoding="latin-1")
 
-if st.button("Run Scraper"):
-    if tp_file and county:
+def extract_first_csv(zip_path: Path) -> Path | None:
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not csvs:
+            return None
+        csv_name = csvs[0]
+        zf.extract(csv_name, path=EXTRACT_DIR)
+        return EXTRACT_DIR / csv_name
+
+def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return None
+
+def _clean_pid_series(s: pd.Series) -> pd.Series:
+    # remove non-alphanumeric + uppercase to normalize IDs
+    return s.astype(str).map(lambda x: re.sub(r"[^0-9A-Za-z]", "", x or "").upper())
+
+def do_merge(tp_file_path: str, county: str):
+    # 1) Find the county’s 2025P ZIP strictly under the 2025P folder
+    file_item = find_2025p_zip(county)
+    if not file_item:
+        st.error(
+            f"No **2025 Preliminary (2025P)** ZIP found for “{county}”. "
+            "It might not be published in the 2025P folder yet, or the name differs."
+        )
+        return None
+
+    st.info(f"Using 2025P ZIP: {file_item['Name']}")
+    # 2) Download & extract
+    zip_path = download_zip(file_item)
+    csv_path = extract_first_csv(zip_path)
+    if not csv_path:
+        st.error("No CSV inside the downloaded ZIP.")
+        return None
+
+    # 3) Load CSVs
+    df_roll = safe_read_csv(csv_path)
+    df_tp = safe_read_csv(tp_file_path)
+
+    # 4) Detect parcel columns
+    roll_col = _find_column(df_roll, ["PARCEL_ID", "PARCELID", "PARCEL", "PARCEL NUMBER", "PARCEL_NO", "PARCELNO"])
+    if not roll_col:
+        st.error(
+            "Parcel column not found in the 2025P CSV (looked for PARCEL_ID / PARCELID / PARCEL / PARCEL NUMBER / PARCEL_NO)."
+        )
+        return None
+
+    tp_col = _find_column(df_tp, ["Parcel ID"])
+    if not tp_col:
+        st.error("Column 'Parcel ID' not found in your TaxProper CSV.")
+        return None
+
+    # 5) Normalize & merge
+    df_roll["_PID_"] = _clean_pid_series(df_roll[roll_col])
+    df_tp["_PID_"] = _clean_pid_series(df_tp[tp_col])
+
+    merged = pd.merge(df_roll, df_tp, on="_PID_", how="inner", suffixes=("_roll", "_tp"))
+
+    # Retry with 0-prefixed TP IDs if empty (common edge case)
+    if merged.empty:
+        tp_retry = df_tp.copy()
+        tp_retry["_PID_"] = "0" + tp_retry["_PID_"]
+        merged = pd.merge(df_roll, tp_retry, on="_PID_", how="inner", suffixes=("_roll", "_tp"))
+
+    return merged if not merged.empty else None
+
+# ============================================================
+# UI
+# ============================================================
+st.title("Florida **2025 Preliminary (2025P)** NAL + TaxProper Merge")
+
+with st.sidebar:
+    st.markdown("### Debug / Inspect 2025P")
+    if st.button("List a few files under 2025P"):
+        try:
+            files = list_all_2025p_files()
+            if not files:
+                st.warning("No files visible under 2025P. The folder may be empty or restricted.")
+            else:
+                st.write("Found files (showing up to 20):")
+                for x in files[:20]:
+                    st.write("-", x.get("Name"))
+        except Exception as e:
+            st.error(f"Listing failed: {e!r}")
+
+tp_file = st.file_uploader("Upload **TaxProper CSV**", type="csv")
+county = st.text_input("County (e.g., Clay, Pinellas)").strip()
+
+c1, c2 = st.columns([1, 1])
+run_clicked = c1.button("Run Merge (2025P only)")
+if c2.button("Clear temp"):
+    try:
+        for p in EXTRACT_DIR.glob("*"):
+            p.unlink(missing_ok=True)
+        st.success("Cleared extracted files.")
+    except Exception as e:
+        st.error(f"Cleanup failed: {e}")
+
+if run_clicked:
+    if not tp_file or not county:
+        st.error("Please upload your TaxProper CSV and enter a county.")
+    else:
         tp_path = "temp_tp.csv"
         with open(tp_path, "wb") as f:
             f.write(tp_file.getbuffer())
 
-        with st.spinner("Scraping and merging..."):
-            final_df = scrape_and_merge(tp_path, county)
+        with st.spinner("Fetching 2025P data and merging…"):
+            final_df = do_merge(tp_path, county)
 
-        if final_df is not None and not final_df.empty:
-            st.success(f"Found {len(final_df)} matches!")
+        if isinstance(final_df, pd.DataFrame) and not final_df.empty:
+            st.success(f"Matches: {len(final_df)}")
             st.dataframe(final_df.head(50))
-            csv_data = final_df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download Results", csv_data, "merged_results.csv")
+            csv_bytes = final_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download Results CSV", csv_bytes, "merged_results_2025P.csv")
         else:
-            st.warning("No matches found after attempting merge.")
-    else:
-        st.error("Please upload a TaxProper file and enter a county name.")
+            st.warning("No matches found (or 2025P county file not available).")
