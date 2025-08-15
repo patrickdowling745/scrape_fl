@@ -1,6 +1,6 @@
 #!/bin/bash
-# Install Playwright dependencies for Chromium
+# Install dependencies for Chromium
 playwright install-deps
 
-# Install Chromium specifically
-playwright install chromium
+# Force install Chromium into the current working directory's .playwright folder
+PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium
