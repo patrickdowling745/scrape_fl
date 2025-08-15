@@ -187,43 +187,53 @@ def _pick_target_width(roll_keys: pd.Series) -> int:
     return int(lengths.max())
 
 def do_merge_selected(tp_file_path: Union[str, Path], file_item: dict):
-    """Chunked merge for very large county files using a selected SharePoint file."""
+    """Chunked merge for very large county files using a selected SharePoint file.
+    Includes ALL TaxProper columns in the output (with '_TP' suffix on name collisions)."""
     import csv
 
     if not file_item:
         st.error("No 2025P ZIP file selected.")
         return None, {}
 
+    # --- Load roll file (from ZIP) ---
     zip_path = download_zip(file_item)
     csv_path = extract_first_csv(zip_path)
     if not csv_path:
         st.error("No CSV inside the downloaded ZIP.")
         return None, {}
 
+    # --- Load TaxProper CSV ---
     df_tp = safe_read_csv(tp_file_path)
     tp_col = _find_column(df_tp, ["Parcel ID"])
     if not tp_col:
         st.error("Column 'Parcel ID' not found in your TaxProper CSV.")
         return None, {}
 
+    # Normalize TP parcel IDs
     df_tp["_PID_"] = _clean_pid_series(df_tp[tp_col])
-    tp_ids = set(df_tp["_PID_"])
 
-    target_width = None
+    # We'll create a zero-filled key later once we infer the roll's target width
+    tp_has_zf = False
+
+    # --- Output CSV path ---
     matches_path = Path(tempfile.gettempdir()) / "merged_results_2025P.csv"
     if matches_path.exists():
         matches_path.unlink()
 
+    # --- Stats ---
     first_pass_count = 0
     retry_count = 0
     roll_rows_total = 0
+    target_width = None
+    roll_col = None
 
     chunksize = 50_000
     with pd.read_csv(csv_path, dtype=str, low_memory=False, chunksize=chunksize) as reader:
         for chunk in reader:
             roll_rows_total += len(chunk)
 
-            if target_width is None:
+            # Identify the roll parcel column & typical width once
+            if roll_col is None:
                 roll_col = _find_column(
                     chunk,
                     ["PARCEL_ID", "PARCELID", "PARCEL", "PARCEL NUMBER", "PARCEL_NO", "PARCELNO"]
@@ -233,28 +243,60 @@ def do_merge_selected(tp_file_path: Union[str, Path], file_item: dict):
                     return None, {}
                 target_width = _pick_target_width(_clean_pid_series(chunk[roll_col]))
 
+                if (target_width or 0) > 0 and not tp_has_zf:
+                    # Build a zero-filled TP key to match counties that pad to fixed width
+                    df_tp["_PID_ZF_"] = df_tp["_PID_"].str.zfill(target_width)
+                    tp_has_zf = True
+
+            # Normalize roll parcel IDs for this chunk
             chunk["_PID_"] = _clean_pid_series(chunk[roll_col])
 
-            fp_mask = chunk["_PID_"].isin(tp_ids)
-            first_pass_matches = chunk.loc[fp_mask]
-            first_pass_count += len(first_pass_matches)
+            # --- First pass: direct key match (_PID_ ↔ _PID_) ---
+            m1 = chunk.merge(
+                df_tp,
+                on="_PID_",
+                how="inner",
+                suffixes=("", "_TP"),
+                copy=False,
+            )
+            first_pass_count += len(m1)
 
-            retry_matches = pd.DataFrame()
-            if target_width > 0:
-                retry_ids = {pid.zfill(target_width) for pid in tp_ids}
-                retry_mask = chunk["_PID_"].isin(retry_ids) & ~fp_mask
-                retry_matches = chunk.loc[retry_mask]
-                retry_count += len(retry_matches)
+            # --- Retry pass: zero-filled match (_PID_ ↔ _PID_ZF_) for unmatched rows ---
+            m2 = pd.DataFrame()
+            if tp_has_zf and (target_width or 0) > 0:
+                # Only attempt retry for roll rows not already matched in m1
+                matched_pids = set(m1["_PID_"].unique())
+                retry_chunk = chunk.loc[~chunk["_PID_"].isin(matched_pids)].copy()
 
-            if not first_pass_matches.empty or not retry_matches.empty:
-                pd.concat([first_pass_matches, retry_matches]).to_csv(
-                    matches_path,
-                    mode="a",
-                    header=not matches_path.exists(),
-                    index=False,
-                    quoting=csv.QUOTE_NONNUMERIC,
-                )
+                if not retry_chunk.empty:
+                    m2 = retry_chunk.merge(
+                        df_tp,
+                        left_on="_PID_",
+                        right_on="_PID_ZF_",
+                        how="inner",
+                        suffixes=("", "_TP"),
+                        copy=False,
+                    )
+                    retry_count += len(m2)
 
+            # Combine this chunk's matches (include all roll + all TP columns)
+            out = pd.concat([m1, m2], ignore_index=True)
+
+            # Drop helper key if present from TP side to keep output tidy
+            if "_PID_ZF_" in out.columns:
+                out = out.drop(columns=["_PID_ZF_"])
+
+            # Append to the output CSV
+            write_header = not matches_path.exists()
+            out.to_csv(
+                matches_path,
+                mode="a",
+                header=write_header,
+                index=False,
+                quoting=csv.QUOTE_NONNUMERIC,
+            )
+
+    # Build preview + stats
     if matches_path.exists() and matches_path.stat().st_size > 0:
         preview_df = pd.read_csv(matches_path, dtype=str, nrows=50)
         stats = {
@@ -270,6 +312,7 @@ def do_merge_selected(tp_file_path: Union[str, Path], file_item: dict):
         return preview_df, stats
 
     return None, {}
+
 
 
 # ============================================================
