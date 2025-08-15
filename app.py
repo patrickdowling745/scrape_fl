@@ -19,7 +19,8 @@ URL = (
 )
 
 def launch_browser(p):
-    path = p.chromium.executable_path()
+    # In sync API, executable_path is already a string, not a method
+    path = p.chromium.executable_path
     st.write("Chromium path:", path)
     if not Path(path).exists():
         st.error(f"Chromium executable not found at {path}")
