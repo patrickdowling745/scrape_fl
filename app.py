@@ -2,6 +2,8 @@ import re
 from pathlib import Path
 import tempfile
 import zipfile
+from typing import Union, List, Optional
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -75,16 +77,17 @@ def render_list(folder_server_relative: str):
     rows = data.get("Row", [])
     files, folders = [], []
     for row in rows:
-        if str(row.get("FSObjType")) == "1":
+        if str(row.get("FSObjType")) == "1":  # folder
             folders.append({
                 "Name": row.get("FileLeafRef"),
                 "ServerRelativeUrl": row.get("FileRef")
             })
-        else:
+        else:  # file
             files.append({
                 "Name": row.get("FileLeafRef"),
                 "ServerRelativeUrl": row.get("FileRef"),
-                "Length": row.get("FileSizeDisplay"),
+                # Render API gives a display string; REST gives bytes in "Length"
+                "Length": row.get("FileSizeDisplay") or row.get("Length"),
             })
     return files, folders
 
@@ -126,6 +129,7 @@ def list_all_2025p_files(max_depth: int = 3):
     return unique_files
 
 def find_2025p_zip(county: str):
+    # kept for compatibility; no longer used in UI
     target = _norm(county)
     for f in list_all_2025p_files():
         nm = f.get("Name") or ""
@@ -148,13 +152,13 @@ def download_zip(file_item: dict) -> Path:
 # ============================================================
 # CSV helpers + merge
 # ============================================================
-def safe_read_csv(path: str | Path) -> pd.DataFrame:
+def safe_read_csv(path: Union[str, Path]) -> pd.DataFrame:
     try:
         return pd.read_csv(path, dtype=str, low_memory=False)
     except UnicodeDecodeError:
         return pd.read_csv(path, dtype=str, low_memory=False, encoding="latin-1")
 
-def extract_first_csv(zip_path: Path) -> Path | None:
+def extract_first_csv(zip_path: Path) -> Optional[Path]:
     with zipfile.ZipFile(zip_path, "r") as zf:
         csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
         if not csvs:
@@ -163,7 +167,7 @@ def extract_first_csv(zip_path: Path) -> Path | None:
         zf.extract(csv_name, path=EXTRACT_DIR)
         return EXTRACT_DIR / csv_name
 
-def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+def _find_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     lower = {c.lower(): c for c in df.columns}
     for cand in candidates:
         if cand.lower() in lower:
@@ -182,13 +186,12 @@ def _pick_target_width(roll_keys: pd.Series) -> int:
         return int(mode.iloc[0])
     return int(lengths.max())
 
-def do_merge(tp_file_path: str, county: str):
-    """Chunked merge for very large county files."""
+def do_merge_selected(tp_file_path: Union[str, Path], file_item: dict):
+    """Chunked merge for very large county files using a selected SharePoint file."""
     import csv
 
-    file_item = find_2025p_zip(county)
     if not file_item:
-        st.error(f"No **2025P** ZIP found for “{county}”.")
+        st.error("No 2025P ZIP file selected.")
         return None, {}
 
     zip_path = download_zip(file_item)
@@ -215,13 +218,16 @@ def do_merge(tp_file_path: str, county: str):
     retry_count = 0
     roll_rows_total = 0
 
-    chunksize = 50000
+    chunksize = 50_000
     with pd.read_csv(csv_path, dtype=str, low_memory=False, chunksize=chunksize) as reader:
         for chunk in reader:
             roll_rows_total += len(chunk)
 
             if target_width is None:
-                roll_col = _find_column(chunk, ["PARCEL_ID", "PARCELID", "PARCEL", "PARCEL NUMBER", "PARCEL_NO", "PARCELNO"])
+                roll_col = _find_column(
+                    chunk,
+                    ["PARCEL_ID", "PARCELID", "PARCEL", "PARCEL NUMBER", "PARCEL_NO", "PARCELNO"]
+                )
                 if not roll_col:
                     st.error("Parcel column not found in roll file.")
                     return None, {}
@@ -242,8 +248,11 @@ def do_merge(tp_file_path: str, county: str):
 
             if not first_pass_matches.empty or not retry_matches.empty:
                 pd.concat([first_pass_matches, retry_matches]).to_csv(
-                    matches_path, mode="a", header=not matches_path.exists(),
-                    index=False, quoting=csv.QUOTE_NONNUMERIC
+                    matches_path,
+                    mode="a",
+                    header=not matches_path.exists(),
+                    index=False,
+                    quoting=csv.QUOTE_NONNUMERIC,
                 )
 
     if matches_path.exists() and matches_path.stat().st_size > 0:
@@ -264,24 +273,54 @@ def do_merge(tp_file_path: str, county: str):
 
 
 # ============================================================
+# Caching for dropdown options
+# ============================================================
+@st.cache_data(show_spinner=False, ttl=3600)
+def list_2025p_zip_files_cached():
+    all_items = list_all_2025p_files()
+    zips = [f for f in all_items if (f.get("Name", "").lower().endswith(".zip"))]
+    # sort by filename for a stable dropdown
+    zips.sort(key=lambda f: (f.get("Name") or "").lower())
+    return zips
+
+
+# ============================================================
 # UI
 # ============================================================
 st.title("Florida 2025P NAL + TaxProper Merge")
 st.caption("Matches by Parcel ID, retries unmatched with leading zeros to the roll's typical width. Handles very large counties safely.")
 
-tp_file = st.file_uploader("Upload TaxProper CSV", type="csv")
-county = st.text_input("County (e.g., Palm Beach, Miami-Dade, Clay)")
+# 1) Choose the roll ZIP from a live dropdown (no text input)
+with st.spinner("Listing available 2025P ZIP files..."):
+    zip_options = list_2025p_zip_files_cached()
 
+selected_zip = st.selectbox(
+    "Choose a 2025P county ZIP",
+    options=zip_options,
+    format_func=lambda f: f.get("Name", "Unknown file") if isinstance(f, dict) else str(f),
+    index=0 if zip_options else None,
+    placeholder="Select a ZIP file..."
+)
+
+# Optional manual refresh
+if st.button("Refresh file list"):
+    list_2025p_zip_files_cached.clear()
+    st.rerun()
+
+# 2) Upload TP CSV
+tp_file = st.file_uploader("Upload TaxProper CSV", type="csv")
+
+# 3) Run
 if st.button("Run Merge"):
-    if not tp_file or not county.strip():
-        st.error("Please upload your TaxProper CSV and enter a county.")
+    if not tp_file or not selected_zip:
+        st.error("Please upload your TaxProper CSV and choose a 2025P ZIP file.")
     else:
         tp_path = "temp_tp.csv"
         with open(tp_path, "wb") as f:
             f.write(tp_file.getbuffer())
 
-        with st.spinner("Processing..."):
-            final_df, stats = do_merge(tp_path, county.strip())
+        with st.spinner(f"Processing {selected_zip.get('Name', 'selected file')}..."):
+            final_df, stats = do_merge_selected(tp_path, selected_zip)
 
         if final_df is not None:
             c1, c2, c3, c4, c5 = st.columns(5)
@@ -303,4 +342,4 @@ if st.button("Run Merge"):
                 mime="text/csv"
             )
         else:
-            st.warning("No matches found or county file not available.")
+            st.warning("No matches found or the selected county file did not yield results.")
